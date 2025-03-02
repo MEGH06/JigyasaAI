@@ -1,7 +1,7 @@
-streamlit
+streamlit==1.22.0
+chromadb==0.4.15
 pillow
 pymupdf
-chromadb
 cloudinary
 google-generativeai
 imagehash
