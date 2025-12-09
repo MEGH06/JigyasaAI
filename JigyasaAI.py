@@ -144,4 +144,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.markdown("Built with ❤️ by [JigyasaAI](https://jigyasa-ai.com)")
+st.markdown("Built with ❤️ by [JigyasaAI](https://github.com/MEGH06/JigyasaAI.git)")
