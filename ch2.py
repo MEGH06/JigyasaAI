@@ -2,9 +2,8 @@ import os
 import re
 import io
 import fitz  # PyMuPDF
-import chromadb
+from pinecone import Pinecone, ServerlessSpec
 import cloudinary
-import google.generativeai as genai
 from PIL import Image
 from imagehash import phash
 from typing import List, Dict, Set, Optional
@@ -12,6 +11,7 @@ from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
 from cloudinary.utils import cloudinary_url
 import cloudinary.uploader
 import tiktoken
+import groq
 import json
 import time
 from datetime import datetime
@@ -26,11 +26,29 @@ cloudinary.config(
     api_key=os.getenv("CLOUDINARY_API_KEY"),
     api_secret=os.getenv("CLOUDINARY_API_SECRET")
 )
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-2.5-flash')
-CHROMA_DB_PATH = "chroma_db"
-PROCESSED_FILES_PATH = os.path.join(CHROMA_DB_PATH, "processed_files.json")
-chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+# Groq Configuration
+groq_client = groq.Groq(api_key=os.getenv("GROQ_API_KEY"))
+GROQ_MODEL = "llama-3.3-70b-versatile" # Premium fast model
+
+PROCESSED_FILES_PATH = "processed_files.json"
+
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+pinecone_index_name = "multimodal-rag"
+
+# ensure index exists
+if pinecone_index_name not in pc.list_indexes().names():
+    print(f"Creating Pinecone index '{pinecone_index_name}'... This may take a moment.")
+    pc.create_index(
+        name=pinecone_index_name,
+        dimension=512,
+        metric="cosine",
+        spec=ServerlessSpec(
+            cloud="aws",
+            region="us-east-1"
+        )
+    )
+pinecone_index = pc.Index(pinecone_index_name)
+
 embedding_function = OpenCLIPEmbeddingFunction()
 
 print('All imports done')
@@ -62,7 +80,9 @@ def load_processed_files():
 def save_processed_files():
     """Save the record of processed files and their image hashes"""
     try:
-        os.makedirs(os.path.dirname(PROCESSED_FILES_PATH), exist_ok=True)
+        dirname = os.path.dirname(PROCESSED_FILES_PATH)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
         
         # Update image metadata in the processed files
         for file_key in PROCESSED_FILES:
@@ -98,26 +118,6 @@ def process_pdf(pdf_path):
         print(f"File {file_key} has already been processed and hasn't changed.")
         return
     
-    # Initialize or get collection (without deleting existing data)
-    collection_name = "multimodal_rag"
-    try:
-        collection = chroma_client.get_or_create_collection(
-            name=collection_name,
-            embedding_function=embedding_function
-        )
-    except Exception as e:
-        print(f"Error creating collection: {e}")
-        # Try recreating the collection if it fails
-        try:
-            chroma_client.delete_collection(collection_name)
-            collection = chroma_client.create_collection(
-                name=collection_name,
-                embedding_function=embedding_function
-            )
-        except Exception as e2:
-            print(f"Fatal error with ChromaDB: {e2}")
-            raise
-    
     # Process the PDF
     all_text_chunks = []
     all_chunk_images = []
@@ -147,9 +147,9 @@ def process_pdf(pdf_path):
             all_text_chunks.extend(text_chunks)
             all_chunk_images.extend(chunk_images)
     
-    # Store content in ChromaDB
+    # Store content in Pinecone
     if all_text_chunks:
-        store_content_in_chroma(all_text_chunks, all_chunk_images, all_images_with_metadata, file_hash)
+        store_content_in_pinecone(all_text_chunks, all_chunk_images, all_images_with_metadata, file_hash)
     
     # Update processed files record
     PROCESSED_FILES[file_key] = {
@@ -304,20 +304,15 @@ def semantic_chunk(text: str, chunk_size: int = 512, overlap: int = 50, max_chun
 
     return chunks
 
-def store_content_in_chroma(text_chunks: List[str], chunk_images: List[List[str]], image_metadata: List[Dict], file_hash: str):
-    collection = chroma_client.get_or_create_collection(
-        name="multimodal_rag",
-        embedding_function=embedding_function
-    )
-    
+def store_content_in_pinecone(text_chunks: List[str], chunk_images: List[List[str]], image_metadata: List[Dict], file_hash: str):
     # Delete existing entries from this PDF
     try:
-        count = collection.count()
-        collection.delete(where={"source": file_hash})
-        new_count = collection.count()
-        print(f"Deleted {count - new_count} entries with source {file_hash}")
+        # Pinecone doesn't return count on delete
+        pinecone_index.delete(filter={"source": file_hash})
+        print(f"Deleted existing entries with source {file_hash}")
     except Exception as e:
-        print(f"Error deleting existing entries: {e}")
+        if "404" not in str(e): # Ignore 404 Namespace not found error
+            print(f"Error deleting existing entries: {e}")
     
     # Generate unique IDs using index to guarantee uniqueness
     text_ids = [
@@ -327,7 +322,7 @@ def store_content_in_chroma(text_chunks: List[str], chunk_images: List[List[str]
     
     # Create metadata for text chunks
     metadatas = []
-    for images in chunk_images:
+    for i, images in enumerate(chunk_images):
         # Store full image URLs and page information
         image_list = []
         for url in images:
@@ -341,6 +336,8 @@ def store_content_in_chroma(text_chunks: List[str], chunk_images: List[List[str]
                     break
         
         metadatas.append({
+            "type": "text",
+            "text": text_chunks[i], # Pinecone requires storing text in metadata
             "images": json.dumps(image_list) if image_list else "",
             "source": str(file_hash),
             "image_urls": ",".join(images) if images else ""
@@ -355,12 +352,22 @@ def store_content_in_chroma(text_chunks: List[str], chunk_images: List[List[str]
     batch_size = 50
     for i in range(0, len(text_chunks), batch_size):
         end_idx = min(i + batch_size, len(text_chunks))
+        
+        # Get embeddings for text chunks
         try:
-            collection.upsert(
-                ids=text_ids[i:end_idx],
-                documents=text_chunks[i:end_idx],
-                metadatas=metadatas[i:end_idx]
-            )
+            text_embeddings = embedding_function(text_chunks[i:end_idx])
+            
+            vectors = []
+            for j, emb in enumerate(text_embeddings):
+                if hasattr(emb, 'tolist'):
+                    emb = emb.tolist()
+                vectors.append({
+                    "id": text_ids[i+j],
+                    "values": emb,
+                    "metadata": metadatas[i+j]
+                })
+                
+            pinecone_index.upsert(vectors=vectors)
             print(f"Successfully upserted text chunks {i+1}-{end_idx} of {len(text_chunks)}")
         except Exception as e:
             print(f"Error upserting text chunks {i+1}-{end_idx}: {e}")
@@ -379,6 +386,8 @@ def store_content_in_chroma(text_chunks: List[str], chunk_images: List[List[str]
             seen_urls.add(url)
             unique_image_urls.append(url)
             unique_image_metadatas.append({
+                "type": "image",
+                "text": f"Image at page {meta.get('page', 0)}",
                 "page": meta.get("page", 0),
                 "public_id": meta.get("public_id", ""),
                 "source": str(file_hash)
@@ -405,13 +414,18 @@ def store_content_in_chroma(text_chunks: List[str], chunk_images: List[List[str]
                     # Get embeddings for image batch
                     image_embeddings = embedding_function(batch_urls)
                     
+                    vectors = []
+                    for j, emb in enumerate(image_embeddings):
+                        if hasattr(emb, 'tolist'):
+                            emb = emb.tolist()
+                        vectors.append({
+                            "id": image_ids[i+j],
+                            "values": emb,
+                            "metadata": unique_image_metadatas[i+j]
+                        })
+                        
                     # Upsert image batch
-                    collection.upsert(
-                        ids=image_ids[i:end_idx],
-                        embeddings=image_embeddings,
-                        metadatas=unique_image_metadatas[i:end_idx],
-                        documents=[f"Image at page {meta.get('page', 0)}" for meta in unique_image_metadatas[i:end_idx]]
-                    )
+                    pinecone_index.upsert(vectors=vectors)
                     print(f"Successfully upserted images {i+1}-{end_idx} of {len(unique_image_urls)}")
                 except Exception as e:
                     print(f"Error upserting images {i+1}-{end_idx}: {e}")
@@ -426,87 +440,86 @@ def store_content_in_chroma(text_chunks: List[str], chunk_images: List[List[str]
 def query_rag(query: str, n_results: int = 5) -> List[Dict]:
     """Enhanced multi-modal RAG query with linked images"""
     try:
-        collection = chroma_client.get_collection(
-            name="multimodal_rag",
-            embedding_function=embedding_function
-        )
+        # Get query embedding
+        query_embedding = embedding_function([query])[0]
+        if hasattr(query_embedding, 'tolist'):
+            query_embedding = query_embedding.tolist()
         
         # Query text first
-        text_results = collection.query(
-            query_texts=[query],
-            n_results=n_results,
-            include=["documents", "metadatas", "distances"]
+        text_results = pinecone_index.query(
+            vector=query_embedding,
+            top_k=n_results,
+            include_metadata=True,
+            filter={"type": "text"}
         )
         
         combined_results = []
         
         # Process text results and their linked images
-        if "documents" in text_results and text_results["documents"]:
-            for i, doc in enumerate(text_results["documents"][0]):
-                result = {
-                    "type": "text",
-                    "content": doc,
-                    "distance": text_results["distances"][0][i] if "distances" in text_results else None
-                }
-                
-                # Add linked images if available
-                if "metadatas" in text_results and text_results["metadatas"][0]:
-                    metadata = text_results["metadatas"][0][i]
-                    if metadata and "image_urls" in metadata and metadata["image_urls"]:
-                        result["images"] = metadata["image_urls"].split(",") if metadata["image_urls"] else []
-                    
-                    # Try the JSON format if available
-                    if metadata and "images" in metadata and metadata["images"]:
-                        try:
-                            image_data = json.loads(metadata["images"])
-                            result["image_data"] = image_data
-                            result["images"] = [img["url"] for img in image_data]
-                        except:
-                            # Fallback if JSON parsing fails
-                            if "images" not in result:
-                                result["images"] = []
-                
-                combined_results.append(result)
+        for match in text_results.matches:
+            metadata = match.metadata
+            result = {
+                "type": "text",
+                "content": metadata.get("text", ""),
+                "distance": match.score # Using score directly, higher is better
+            }
+            
+            # Add linked images if available
+            if metadata and "image_urls" in metadata and metadata["image_urls"]:
+                result["images"] = metadata["image_urls"].split(",") if metadata["image_urls"] else []
+            
+            # Try the JSON format if available
+            if metadata and "images" in metadata and metadata["images"]:
+                try:
+                    image_data = json.loads(metadata["images"])
+                    result["image_data"] = image_data
+                    result["images"] = [img["url"] for img in image_data]
+                except:
+                    # Fallback if JSON parsing fails
+                    if "images" not in result:
+                        result["images"] = []
+            
+            combined_results.append(result)
         
         # Query for images directly using text-to-image search
-        # Without using the $exists operator which is not supported
-        image_query_results = collection.query(
-            query_texts=[query],
-            n_results=3,
-            include=["documents", "metadatas", "distances"]
+        image_query_results = pinecone_index.query(
+            vector=query_embedding,
+            top_k=3,
+            include_metadata=True,
+            filter={"type": "image"}
         )
         
         # Add image results from direct query
-        if "metadatas" in image_query_results and image_query_results["metadatas"]:
-            for i, metadata in enumerate(image_query_results["metadatas"][0]):
-                if metadata and "public_id" in metadata:
-                    # This is an image document
-                    image_url = None
-                    
-                    # Find the URL for this public_id in our cache
-                    for meta_url, meta in IMAGE_METADATA_CACHE.items():
-                        if meta.get("public_id") == metadata["public_id"]:
-                            image_url = meta.get("url")
+        for match in image_query_results.matches:
+            metadata = match.metadata
+            if metadata and "public_id" in metadata:
+                # This is an image document
+                image_url = None
+                
+                # Find the URL for this public_id in our cache
+                for meta_url, meta in IMAGE_METADATA_CACHE.items():
+                    if meta.get("public_id") == metadata["public_id"]:
+                        image_url = meta.get("url")
+                        break
+                
+                if image_url:
+                    # Check if this image is already included in a text result
+                    already_included = False
+                    for result in combined_results:
+                        if "images" in result and image_url in result["images"]:
+                            already_included = True
                             break
                     
-                    if image_url:
-                        # Check if this image is already included in a text result
-                        already_included = False
-                        for result in combined_results:
-                            if "images" in result and image_url in result["images"]:
-                                already_included = True
-                                break
-                        
-                        if not already_included:
-                            combined_results.append({
-                                "type": "image",
-                                "content": image_url,
-                                "distance": image_query_results["distances"][0][i] if "distances" in image_query_results else None,
-                                "page": metadata.get("page", 0)
-                            })
+                    if not already_included:
+                        combined_results.append({
+                            "type": "image",
+                            "content": image_url,
+                            "distance": match.score,
+                            "page": metadata.get("page", 0)
+                        })
         
-        # Sort by relevance (distance)
-        combined_results.sort(key=lambda x: x["distance"] if x["distance"] is not None else float('inf'))
+        # Sort by relevance (Pinecone score is similarity, so higher is better)
+        combined_results.sort(key=lambda x: x["distance"] if x["distance"] is not None else float('-inf'), reverse=True)
         
         return combined_results
     except Exception as e:
@@ -577,11 +590,23 @@ def generate_response(query: str) -> str:
     DO NOT include the image URLs in your response text."""
     
     try:
-        response = model.generate_content(prompt)
-        gemini_text = response.text.strip()
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that answers queries based on provided multi-modal context (text and image references). Provide comprehensive answers. DO NOT include image URLs in your response text."
+                },
+                {
+                    "role": "user",
+                    "content": f"Context:\n{context}\n\nQuery: {query}"
+                }
+            ],
+            model=GROQ_MODEL,
+        )
+        groq_text = chat_completion.choices[0].message.content.strip()
         
         # Explicitly add the image URLs to the response
-        final_response = gemini_text
+        final_response = groq_text
         
         # Add relevant images section with explicit URLs
         if unique_image_urls:
